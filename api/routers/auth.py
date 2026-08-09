@@ -1,22 +1,28 @@
 # Authentication endpoints: signup, login, logout, and "who am I".
 #
 # Sessions are tracked with a random token stored in the database and
-# sent to the browser as an httpOnly cookie. The browser sends the
-# cookie back automatically on every request after login, so the
-# frontend doesn't need to manage tokens by hand.
+# handed to the client in the login response. The client stores it
+# (e.g. localStorage) and sends it back as `Authorization: Bearer
+# <token>` on every request after login - a plain bearer token instead
+# of a cookie, because the client and API are on different origins
+# (and, once deployed, different *.hf.space domains). Cross-site
+# cookies need SameSite=None, and browsers increasingly block those by
+# default (third-party cookie blocking, strict tracking prevention,
+# privacy extensions) - which silently breaks a "logged in" cookie
+# even though the login request itself succeeded. A bearer token sent
+# explicitly in a header doesn't depend on that browser cookie policy
+# at all.
 
 import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, HTTPException, Response
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from database import get_connection, row_to_dict
 from security import hash_password, verify_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
-
-SESSION_COOKIE_NAME = "session_token"
 
 
 class Credentials(BaseModel):
@@ -52,7 +58,7 @@ def signup(credentials: Credentials):
 
 
 @router.post("/login")
-def login(credentials: Credentials, response: Response):
+def login(credentials: Credentials):
     user_id = credentials.user_id.strip()
     password = credentials.password
 
@@ -73,43 +79,34 @@ def login(credentials: Credentials, response: Response):
     conn.commit()
     conn.close()
 
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=token,
-        httponly=True,  # JavaScript can't read this cookie - reduces XSS risk
-        # The frontend is a different origin now, so this cookie must be sent
-        # cross-site. Browsers require SameSite=None to be paired with
-        # Secure - that's fine for a deployed (HTTPS) frontend/backend, and
-        # browsers special-case http://localhost as a "secure" origin too,
-        # so local dev keeps working without HTTPS.
-        samesite="none",
-        secure=True,
-        max_age=60 * 60 * 24,  # 1 day, in seconds
-    )
-    return {"message": "Logged in", "user_id": user_id}
+    return {"message": "Logged in", "user_id": user_id, "token": token}
 
 
 @router.post("/logout")
-def logout(
-    response: Response,
-    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
-):
-    if session_token:
+def logout(authorization: Optional[str] = Header(default=None)):
+    token = get_token_from_header(authorization)
+    if token:
         conn = get_connection()
-        conn.execute("DELETE FROM sessions WHERE token = ?", (session_token,))
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
         conn.commit()
         conn.close()
 
-    response.delete_cookie(SESSION_COOKIE_NAME)
     return {"message": "Logged out"}
 
 
 @router.get("/me")
-def me(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME)):
-    user_id = get_current_user(session_token)
+def me(authorization: Optional[str] = Header(default=None)):
+    user_id = get_current_user(get_token_from_header(authorization))
     if user_id is None:
         raise HTTPException(status_code=401, detail="Not logged in")
     return {"user_id": user_id}
+
+
+def get_token_from_header(authorization: Optional[str]) -> Optional[str]:
+    """Pull the raw token out of an `Authorization: Bearer <token>` header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    return authorization.removeprefix("Bearer ").strip() or None
 
 
 def get_current_user(session_token: Optional[str]) -> Optional[str]:

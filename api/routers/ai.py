@@ -1,36 +1,79 @@
-# Placeholder for AI-related endpoints.
+# AI endpoints. Currently one real feature: simplifying text down to
+# "explain it like I'm 5" language, via a model hosted on Ollama Cloud.
 #
-# This router is kept separate from auth.py on purpose: as you add
-# real AI features (chat, summarization, image generation, etc.),
-# add new endpoints here - or create more files like this one, one
-# per feature area - instead of piling everything into main.py.
-# Register any new router in main.py the same way this one is
-# registered (see app.include_router(ai.router)).
+# Add more AI features here the same way - or in new files under
+# routers/, registered in main.py - following the ping()/simplify()
+# pattern: read the session cookie, call get_current_user() to enforce
+# login, then do the actual work.
 
+import os
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, HTTPException
+import ollama
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel
 
-from routers.auth import SESSION_COOKIE_NAME, get_current_user
+from routers.auth import get_current_user, get_token_from_header
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
+OLLAMA_API_KEY = os.environ["OLLAMA_API_KEY"]
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+MAX_WORDS = 4000
+
+ollama_client = ollama.Client(
+    host="https://ollama.com",
+    headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"},
+)
+
+SYSTEM_PROMPT = (
+    "You explain things to a curious 5-year-old. Rewrite the user's text "
+    "using very short words and short sentences. No jargon. Keep every "
+    "true fact from the original - just make it simple. Reply with only "
+    "the rewritten explanation, no preamble."
+)
+
 
 @router.get("/ping")
-def ping(session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME)):
-    """Example of a protected endpoint - only logged-in users can call it.
-
-    Replace this with real AI endpoints later, e.g.:
-
-        @router.post("/chat")
-        def chat(message: ChatMessage, session_token: Optional[str] = Cookie(...)):
-            user_id = get_current_user(session_token)
-            if user_id is None:
-                raise HTTPException(status_code=401, detail="Not logged in")
-            ...call your AI model here...
-    """
-    user_id = get_current_user(session_token)
+def ping(authorization: Optional[str] = Header(default=None)):
+    """Example of a protected endpoint - only logged-in users can call it."""
+    user_id = get_current_user(get_token_from_header(authorization))
     if user_id is None:
         raise HTTPException(status_code=401, detail="Not logged in")
 
     return {"message": "AI router is wired up and ready.", "requested_by": user_id}
+
+
+class SimplifyRequest(BaseModel):
+    text: str
+
+
+@router.post("/simplify")
+def simplify(
+    body: SimplifyRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    user_id = get_current_user(get_token_from_header(authorization))
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Not logged in")
+
+    text = body.text.strip()
+    word_count = len(text.split())
+
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if word_count > MAX_WORDS:
+        raise HTTPException(status_code=400, detail=f"text is too long ({word_count} / {MAX_WORDS} words)")
+
+    try:
+        response = ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"AI request failed: {exc}") from exc
+
+    return {"result": response["message"]["content"].strip()}
